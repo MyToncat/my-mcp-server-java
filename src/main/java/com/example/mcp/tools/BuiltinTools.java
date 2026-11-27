@@ -16,9 +16,13 @@ import java.util.Map;
  */
 public final class BuiltinTools {
 
+    /** 工具集合类私有构造器，禁止实例化 */
     private BuiltinTools() {
     }
 
+    /**
+     * 返回全部内置 MCP 工具实例列表，供服务端启动时统一注册。
+     */
     public static List<McpTool> all() {
         return List.of(
                 new GetCurrentTimeTool(),
@@ -32,6 +36,7 @@ public final class BuiltinTools {
      */
     public static final class GetCurrentTimeTool implements McpTool {
 
+        /** 人类可读的本地化日期时间格式 */
         private static final DateTimeFormatter READABLE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z");
 
         @Override
@@ -63,6 +68,7 @@ public final class BuiltinTools {
             String tz = JsonCodec.asString(arguments.get("timezone"));
             ZoneId zoneId;
             try {
+                // 未传入 timezone 时回退到操作系统默认时区
                 zoneId = (tz == null || tz.isBlank()) ? ZoneId.systemDefault() : ZoneId.of(tz.trim());
             } catch (Exception e) {
                 return ToolResult.error("无效的时区名称: " + tz);
@@ -121,6 +127,9 @@ public final class BuiltinTools {
             return ToolResult.text(expr.trim() + " = " + formatted);
         }
 
+        /**
+         * 格式化数值结果：整数值去除小数点，小数去除末尾多余零并避免科学计数法。
+         */
         private static String formatNumber(double value) {
             if (value == Math.rint(value) && Math.abs(value) <= Long.MAX_VALUE) {
                 return Long.toString((long) value);
@@ -167,6 +176,7 @@ public final class BuiltinTools {
             int charCount = text.length();
             long nonWhitespaceCount = text.chars().filter(ch -> !Character.isWhitespace(ch)).count();
             int wordCount = text.isBlank() ? 0 : text.trim().split("\\s+").length;
+            // limit=-1 保留末尾空行，与常见编辑器行统计口径一致
             int lineCount = text.isEmpty() ? 0 : text.split("\r?\n", -1).length;
             int utf8Bytes = text.getBytes(StandardCharsets.UTF_8).length;
 
@@ -182,16 +192,24 @@ public final class BuiltinTools {
     }
 
     /**
-     * 递归下降数学表达式解析器。
+     * 递归下降数学表达式解析器（按运算符优先级逐层下降：加减 -> 乘除模 -> 幂 -> 一元正负 -> 括号/字面量/函数）。
      */
     static final class ExpressionParser {
+        /** 待求值表达式原始文本 */
         private final String input;
+        /** 当前字符扫描游标 */
         private int pos = 0;
 
+        /**
+         * 构造内部表达式解析器实例。
+         */
         private ExpressionParser(String input) {
             this.input = input;
         }
 
+        /**
+         * 解析并计算给定数学表达式，若存在未消费的尾随字符则抛出异常。
+         */
         static double evaluate(String expression) {
             ExpressionParser parser = new ExpressionParser(expression);
             double value = parser.parseExpression();
@@ -202,12 +220,18 @@ public final class BuiltinTools {
             return value;
         }
 
+        /**
+         * 跳过当前游标处的全部空白字符。
+         */
         private void skipWhitespace() {
             while (pos < input.length() && Character.isWhitespace(input.charAt(pos))) {
                 pos++;
             }
         }
 
+        /**
+         * 跳过空白后尝试匹配并消费指定字符。
+         */
         private boolean eat(char ch) {
             skipWhitespace();
             if (pos < input.length() && input.charAt(pos) == ch) {
@@ -217,6 +241,9 @@ public final class BuiltinTools {
             return false;
         }
 
+        /**
+         * 解析加减法层（最低优先级）。
+         */
         private double parseExpression() {
             double x = parseTerm();
             while (true) {
@@ -230,6 +257,9 @@ public final class BuiltinTools {
             }
         }
 
+        /**
+         * 解析乘、除、取模运算层（校验除数与模数非零）。
+         */
         private double parseTerm() {
             double x = parsePower();
             while (true) {
@@ -253,6 +283,9 @@ public final class BuiltinTools {
             }
         }
 
+        /**
+         * 解析右结合幂运算（^），指数部分递归调用 parsePower 实现右结合（如 2^3^2 = 2^(3^2)）。
+         */
         private double parsePower() {
             double base = parseUnary();
             if (eat('^')) {
@@ -261,6 +294,9 @@ public final class BuiltinTools {
             return base;
         }
 
+        /**
+         * 解析一元正负号（+x / -x）。
+         */
         private double parseUnary() {
             if (eat('+')) {
                 return parseUnary();
@@ -271,6 +307,9 @@ public final class BuiltinTools {
             return parsePrimary();
         }
 
+        /**
+         * 解析基础项：括号子表达式、数字字面量、内置函数调用或数学常量（pi / e）。
+         */
         private double parsePrimary() {
             skipWhitespace();
             if (eat('(')) {
@@ -292,6 +331,7 @@ public final class BuiltinTools {
                     pos++;
                 }
                 String ident = input.substring(start, pos).toLowerCase();
+                // 标识符后紧跟 '(' 时按白名单函数调用处理，否则按常量解析
                 if (eat('(')) {
                     double firstArg = parseExpression();
                     double result = switch (ident) {

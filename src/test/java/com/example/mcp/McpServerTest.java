@@ -25,15 +25,25 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * MCP 核心协议、JSON 编解码、Stdio 传输、Streamable HTTP 传输及日志输出综合测试套件。
+ */
 class McpServerTest {
 
+    /** 每个测试方法独立初始化的 MCP 服务端实例 */
     private McpServer server;
 
+    /**
+     * 初始化无日志输出的默认测试服务端。
+     */
     @BeforeEach
     void setUp() {
         server = Main.createServer(null);
     }
 
+    /**
+     * 验证手写 JSON 编解码器的往返一致性及字符串转义处理。
+     */
     @Test
     void jsonCodecRoundTripAndEscapes() {
         Map<String, Object> input = JsonCodec.objectOf(
@@ -55,6 +65,9 @@ class McpServerTest {
         assertEquals(List.of("a", 1L, false), parsed.get("items"));
     }
 
+    /**
+     * 验证非法 JSON（语法错误、前导零、尾随逗号、多余尾随字符）被严格拒绝。
+     */
     @Test
     void jsonCodecRejectsMalformedInput() {
         assertThrows(JsonParseException.class, () -> JsonCodec.parse("{invalid}"));
@@ -63,6 +76,9 @@ class McpServerTest {
         assertThrows(JsonParseException.class, () -> JsonCodec.parse("{\"a\":1} trailing"));
     }
 
+    /**
+     * 验证 initialize 握手、notifications/initialized 状态变更及 ping 响应。
+     */
     @Test
     void initializeAndNotificationsLifecycle() {
         String initReq = """
@@ -89,6 +105,9 @@ class McpServerTest {
         assertEquals(Map.of(), pingResp.get("result"));
     }
 
+    /**
+     * 验证 tools/list 与内置工具（calculate、get_current_time、text_stats）调用及除零错误处理。
+     */
     @Test
     void toolsListAndCall() {
         Map<String, Object> listResp = JsonCodec.asObject(
@@ -133,6 +152,9 @@ class McpServerTest {
         assertEquals(2L, statsMap.get("lines"));
     }
 
+    /**
+     * 验证 resources/list、resources/read 与 prompts/get 渲染流程。
+     */
     @Test
     void resourcesAndPrompts() {
         Map<String, Object> resList = JsonCodec.asObject(
@@ -157,6 +179,9 @@ class McpServerTest {
         assertTrue(promptText.contains("int a = 1;"));
     }
 
+    /**
+     * 验证 JSON-RPC 错误码（-32700/-32601/-32602）、BOM 兼容及 Stdio 流端到端消息循环。
+     */
     @Test
     void jsonRpcErrorCodesAndStdioStreamLoop() throws Exception {
         // Parse error (-32700)
@@ -197,6 +222,9 @@ class McpServerTest {
         assertEquals(2L, JsonCodec.asObject(JsonCodec.parse(outputLines[1])).get("id"));
     }
 
+    /**
+     * 验证 Streamable HTTP 完整会话生命周期：健康检查、会话创建、通知 202、工具调用与 DELETE 注销。
+     */
     @Test
     void streamableHttpFullSessionLifecycle() throws Exception {
         try (StreamableHttpTransport http = new StreamableHttpTransport(server, "127.0.0.1", 0, "/mcp")) {
@@ -289,6 +317,9 @@ class McpServerTest {
         }
     }
 
+    /**
+     * 验证 Streamable HTTP 无状态直调、SSE 响应协商、错误码校验、GET SSE 流及 CLI 参数解析。
+     */
     @Test
     void streamableHttpStatelessSseAndErrors() throws Exception {
         try (StreamableHttpTransport http = new StreamableHttpTransport(server, "127.0.0.1", 0, "/mcp")) {
@@ -368,5 +399,54 @@ class McpServerTest {
             assertEquals(9090, cfg.port());
             assertEquals("/custom", cfg.path());
         }
+    }
+
+    /**
+     * 验证详细调用过程日志仅写入 logStream（stderr），不会污染 Stdio stdout JSON-RPC 输出。
+     */
+    @Test
+    void detailedInvocationLoggingWritesToLogStreamOnly() throws Exception {
+        ByteArrayOutputStream logBuf = new ByteArrayOutputStream();
+        McpServer loggedServer = Main.createServer(new PrintStream(logBuf, true, StandardCharsets.UTF_8));
+
+        // Stdio 调用：验证 stdout 仅输出合法 JSON，调用过程日志全部进入 logStream
+        String inputLines = String.join("\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"clientInfo\":{\"name\":\"log-check\",\"version\":\"1.0\"}}}",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"calculate\",\"arguments\":{\"expression\":\"2 + 3\"}}}"
+        ) + "\n";
+        ByteArrayOutputStream outBuf = new ByteArrayOutputStream();
+        loggedServer.run(
+                new ByteArrayInputStream(inputLines.getBytes(StandardCharsets.UTF_8)),
+                new PrintStream(outBuf, true, StandardCharsets.UTF_8)
+        );
+
+        String[] stdoutLines = outBuf.toString(StandardCharsets.UTF_8).trim().split("\r?\n");
+        assertEquals(2, stdoutLines.length);
+        for (String line : stdoutLines) {
+            assertNotNull(JsonCodec.asObject(JsonCodec.parse(line)));
+        }
+
+        // HTTP 调用：验证 HTTP 与 Tool 日志也被记录
+        try (StreamableHttpTransport http = new StreamableHttpTransport(loggedServer, "127.0.0.1", 0, "/mcp")) {
+            http.start();
+            HttpClient client = HttpClient.newHttpClient();
+            client.send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + http.getPort() + "/mcp"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+        }
+
+        String logs = logBuf.toString(StandardCharsets.UTF_8);
+        assertTrue(logs.contains("[mcp-server] [stdio] <-- recv line#1"));
+        assertTrue(logs.contains("Initialized handshake: client=log-check v1.0"));
+        assertTrue(logs.contains("<-- Request id=2 method=tools/call"));
+        assertTrue(logs.contains("[tool:calculate] Executing with arguments="));
+        assertTrue(logs.contains("--> Response id=2 method=tools/call status=OK"));
+        assertTrue(logs.contains("[http] <-- POST /mcp"));
+        assertTrue(logs.contains("[http] --> POST /mcp"));
     }
 }

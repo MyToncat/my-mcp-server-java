@@ -26,12 +26,20 @@ import java.util.concurrent.CountDownLatch;
  */
 public final class Main {
 
+    /** 服务端标识名称 */
     public static final String SERVER_NAME = "mcp-server-java";
+    /** 服务端语义化版本号 */
     public static final String SERVER_VERSION = "1.0.0";
 
+    /** 入口类私有构造器，禁止实例化 */
     private Main() {
     }
 
+    /**
+     * 创建并初始化 {@link McpServer} 实例，注册所有内置 Tools、Resources 与 Prompts。
+     *
+     * @param logStream 日志输出流（运行期绑定到 {@code stderr}，测试中可传 {@code null} 或内存流）
+     */
     public static McpServer createServer(PrintStream logStream) {
         McpServer server = new McpServer(
                 SERVER_NAME,
@@ -131,6 +139,9 @@ public final class Main {
         return server;
     }
 
+    /**
+     * 程序入口：解析命令行参数与环境变量，并按所选传输模式启动 MCP 服务。
+     */
     public static void main(String[] args) throws IOException {
         PrintStream utf8Out = new PrintStream(System.out, true, StandardCharsets.UTF_8);
         PrintStream utf8Err = new PrintStream(System.err, true, StandardCharsets.UTF_8);
@@ -158,6 +169,12 @@ public final class Main {
         }
     }
 
+    /**
+     * 仅启动 Streamable HTTP 服务（无 stdin 依赖，适合后台或容器部署）。
+     * <p>
+     * 主线程通过 {@link CountDownLatch} 阻塞等待 JVM 退出信号（Ctrl+C / SIGTERM），
+     * 并在关闭钩子中优雅释放 HTTP 服务与活跃 SSE 连接。
+     */
     private static void runHttpOnly(McpServer server, ServerConfig config) throws IOException {
         CountDownLatch stopLatch = new CountDownLatch(1);
         try (StreamableHttpTransport http = new StreamableHttpTransport(server, config.host, config.port, config.path)) {
@@ -174,6 +191,13 @@ public final class Main {
         }
     }
 
+    /**
+     * 同时启动 Stdio 与 Streamable HTTP 两种传输模式。
+     * <p>
+     * HTTP 服务在虚拟线程中异步处理远程请求，主线程运行 Stdio 读取循环；
+     * 当标准输入关闭（EOF）时通过 try-with-resources 自动关闭 HTTP 服务，
+     * 避免管道批量调用或 Stdio 客户端断开后残留后台线程导致进程无法退出。
+     */
     private static void runStdioAndHttp(McpServer server, ServerConfig config, PrintStream utf8Out) throws IOException {
         try (StreamableHttpTransport http = new StreamableHttpTransport(server, config.host, config.port, config.path)) {
             Runtime.getRuntime().addShutdownHook(new Thread(http::close, "mcp-http-shutdown"));
@@ -183,6 +207,9 @@ public final class Main {
         }
     }
 
+    /**
+     * 解析服务启动配置，优先级：命令行参数 &gt; 环境变量 &gt; 默认值。
+     */
     static ServerConfig parseConfig(String[] args) {
         TransportMode transport = parseTransport(envOrDefault("MCP_TRANSPORT", "both"));
         String host = envOrDefault("MCP_HOST", "0.0.0.0");
@@ -204,6 +231,9 @@ public final class Main {
         return new ServerConfig(transport, host, port, path, help);
     }
 
+    /**
+     * 读取成对命令行参数的下一个值，缺失时抛出参数异常。
+     */
     private static String nextArgValue(String[] args, int index, String flag) {
         if (index >= args.length) {
             throw new IllegalArgumentException(flag + " 缺少参数值");
@@ -211,11 +241,17 @@ public final class Main {
         return args[index];
     }
 
+    /**
+     * 读取环境变量，若未设置或为空白字符串则返回默认值。
+     */
     private static String envOrDefault(String name, String defaultValue) {
         String val = System.getenv(name);
         return (val == null || val.isBlank()) ? defaultValue : val.trim();
     }
 
+    /**
+     * 解析传输模式枚举（忽略大小写，兼容别名 all / streamable-http）。
+     */
     private static TransportMode parseTransport(String value) {
         return switch (value.toLowerCase(Locale.ROOT)) {
             case "both", "all" -> TransportMode.BOTH;
@@ -225,6 +261,9 @@ public final class Main {
         };
     }
 
+    /**
+     * 校验并解析监听端口（允许 0 表示由操作系统分配临时端口，常用于测试）。
+     */
     private static int parsePort(String value) {
         try {
             int port = Integer.parseInt(value.trim());
@@ -237,6 +276,9 @@ public final class Main {
         }
     }
 
+    /**
+     * 打印命令行用法说明到指定流（通常为 stderr）。
+     */
     private static void printUsage(PrintStream out) {
         out.println("""
                 用法: java -Dfile.encoding=UTF-8 -jar mcp-server-java-1.0.0.jar [选项]
@@ -252,10 +294,21 @@ public final class Main {
                   MCP_TRANSPORT, MCP_HOST, MCP_PORT, MCP_PATH""");
     }
 
+    /**
+     * 支持的传输运行模式。
+     */
     enum TransportMode {
-        BOTH, STDIO, HTTP
+        /** 同时开启 Stdio 与 Streamable HTTP */
+        BOTH,
+        /** 仅开启 Stdio */
+        STDIO,
+        /** 仅开启 Streamable HTTP */
+        HTTP
     }
 
+    /**
+     * 服务端启动配置快照。
+     */
     record ServerConfig(TransportMode transport, String host, int port, String path, boolean help) {
     }
 }
