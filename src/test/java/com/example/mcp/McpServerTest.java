@@ -4,13 +4,22 @@ import com.example.mcp.json.JsonCodec;
 import com.example.mcp.json.JsonCodec.JsonParseException;
 import com.example.mcp.protocol.JsonRpc;
 import com.example.mcp.server.McpServer;
+import com.example.mcp.server.StreamableHttpTransport;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -186,5 +195,178 @@ class McpServerTest {
         assertEquals(2, outputLines.length);
         assertEquals(1L, JsonCodec.asObject(JsonCodec.parse(outputLines[0])).get("id"));
         assertEquals(2L, JsonCodec.asObject(JsonCodec.parse(outputLines[1])).get("id"));
+    }
+
+    @Test
+    void streamableHttpFullSessionLifecycle() throws Exception {
+        try (StreamableHttpTransport http = new StreamableHttpTransport(server, "127.0.0.1", 0, "/mcp")) {
+            http.start();
+            String baseUrl = "http://127.0.0.1:" + http.getPort();
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+
+            // 1. /health 健康检查
+            HttpResponse<String> healthResp = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/health")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(200, healthResp.statusCode());
+            assertEquals("streamable-http", JsonCodec.asObject(JsonCodec.parse(healthResp.body())).get("transport"));
+
+            // 2. initialize 获取 Mcp-Session-Id
+            String initBody = """
+                    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"http-test","version":"1.0"}}}
+                    """;
+            HttpResponse<String> initResp = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/mcp"))
+                            .header("Content-Type", "application/json")
+                            .header("Accept", "application/json, text/event-stream")
+                            .POST(HttpRequest.BodyPublishers.ofString(initBody, StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(200, initResp.statusCode());
+            String sessionId = initResp.headers().firstValue(StreamableHttpTransport.HEADER_SESSION_ID).orElse(null);
+            assertNotNull(sessionId);
+            assertFalse(http.getSession(sessionId).isInitialized());
+
+            // 3. notifications/initialized 应返回 202 Accepted 且无响应体
+            HttpResponse<String> notifResp = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/mcp"))
+                            .header("Content-Type", "application/json")
+                            .header(StreamableHttpTransport.HEADER_SESSION_ID, sessionId)
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(202, notifResp.statusCode());
+            assertTrue(http.getSession(sessionId).isInitialized());
+            // HTTP 会话应与默认 Stdio 会话隔离
+            assertFalse(server.isInitialized());
+
+            // 4. 携带 Session 调用 tools/call
+            String calcBody = """
+                    {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calculate","arguments":{"expression":"sqrt(81) + 1"}}}
+                    """;
+            HttpResponse<String> calcResp = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/mcp"))
+                            .header("Content-Type", "application/json")
+                            .header("Accept", "application/json, text/event-stream")
+                            .header(StreamableHttpTransport.HEADER_SESSION_ID, sessionId)
+                            .header(StreamableHttpTransport.HEADER_PROTOCOL_VERSION, "2025-03-26")
+                            .POST(HttpRequest.BodyPublishers.ofString(calcBody, StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(200, calcResp.statusCode());
+            Map<String, Object> calcJson = JsonCodec.asObject(JsonCodec.parse(calcResp.body()));
+            String text = JsonCodec.asString(
+                    JsonCodec.asObject(JsonCodec.asArray(JsonCodec.asObject(calcJson.get("result")).get("content")).get(0)).get("text")
+            );
+            assertTrue(text.endsWith("= 10"));
+
+            // 5. DELETE /mcp 注销会话
+            HttpResponse<String> delResp = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/mcp"))
+                            .header(StreamableHttpTransport.HEADER_SESSION_ID, sessionId)
+                            .DELETE()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(204, delResp.statusCode());
+
+            // 6. 使用已销毁的 Session 应返回 404
+            HttpResponse<String> afterDel = client.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/mcp"))
+                            .header("Content-Type", "application/json")
+                            .header(StreamableHttpTransport.HEADER_SESSION_ID, sessionId)
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(404, afterDel.statusCode());
+        }
+    }
+
+    @Test
+    void streamableHttpStatelessSseAndErrors() throws Exception {
+        try (StreamableHttpTransport http = new StreamableHttpTransport(server, "127.0.0.1", 0, "/mcp")) {
+            http.start();
+            String mcpUrl = "http://127.0.0.1:" + http.getPort() + "/mcp";
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+
+            // 1. 不带 Mcp-Session-Id 直接手工调用 tools/list
+            HttpResponse<String> statelessResp = client.send(
+                    HttpRequest.newBuilder(URI.create(mcpUrl))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(200, statelessResp.statusCode());
+            List<Object> tools = JsonCodec.asArray(
+                    JsonCodec.asObject(JsonCodec.asObject(JsonCodec.parse(statelessResp.body())).get("result")).get("tools")
+            );
+            assertEquals(3, tools.size());
+
+            // 2. Accept 仅指定 text/event-stream 时返回 SSE 格式
+            HttpResponse<String> ssePostResp = client.send(
+                    HttpRequest.newBuilder(URI.create(mcpUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Accept", "text/event-stream")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(200, ssePostResp.statusCode());
+            assertTrue(ssePostResp.headers().firstValue("Content-Type").orElse("").startsWith("text/event-stream"));
+            assertTrue(ssePostResp.body().contains("event: message\ndata: "));
+
+            // 3. 非法 JSON 返回 400 + -32700
+            HttpResponse<String> badJsonResp = client.send(
+                    HttpRequest.newBuilder(URI.create(mcpUrl))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{bad", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(400, badJsonResp.statusCode());
+            assertEquals((long) JsonRpc.PARSE_ERROR,
+                    JsonCodec.asObject(JsonCodec.asObject(JsonCodec.parse(badJsonResp.body())).get("error")).get("code"));
+
+            // 4. 不支持的 MCP-Protocol-Version 返回 400
+            HttpResponse<String> badProtoResp = client.send(
+                    HttpRequest.newBuilder(URI.create(mcpUrl))
+                            .header("Content-Type", "application/json")
+                            .header(StreamableHttpTransport.HEADER_PROTOCOL_VERSION, "1999-01-01")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}", StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            assertEquals(400, badProtoResp.statusCode());
+
+            // 5. GET /mcp 建立 SSE 流并收到初始保活注释
+            HttpResponse<InputStream> getSseResp = client.send(
+                    HttpRequest.newBuilder(URI.create(mcpUrl))
+                            .header("Accept", "text/event-stream")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofInputStream()
+            );
+            assertEquals(200, getSseResp.statusCode());
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(getSseResp.body(), StandardCharsets.UTF_8))) {
+                assertEquals(": connected", reader.readLine());
+            }
+
+            // 6. CLI 参数解析验证
+            Main.ServerConfig cfg = Main.parseConfig(new String[]{"--transport", "http", "--host", "127.0.0.1", "--port", "9090", "--path", "/custom"});
+            assertEquals(Main.TransportMode.HTTP, cfg.transport());
+            assertEquals("127.0.0.1", cfg.host());
+            assertEquals(9090, cfg.port());
+            assertEquals("/custom", cfg.path());
+        }
     }
 }

@@ -21,14 +21,14 @@ import java.util.Set;
 /**
  * 手工编写的 MCP (Model Context Protocol) 核心服务端。
  * <p>
- * 基于 Stdio 传输层（按行分隔的 UTF-8 JSON-RPC 2.0 消息）：
- * - stdout 仅输出合法的 JSON-RPC 响应行
- * - 日志与调试信息统一输出到 stderr，绝不污染 stdout
+ * 传输层无关的核心调度器，可同时服务于：
+ * - Stdio 传输层（按行分隔的 UTF-8 JSON-RPC 2.0 消息，stdout 仅输出 JSON-RPC 响应，日志走 stderr）
+ * - Streamable HTTP 传输层（单端点 /mcp，支持多会话隔离）
  */
 public final class McpServer {
 
-    private static final String LATEST_PROTOCOL_VERSION = "2025-03-26";
-    private static final Set<String> SUPPORTED_PROTOCOL_VERSIONS = Set.of(
+    public static final String LATEST_PROTOCOL_VERSION = "2025-03-26";
+    public static final Set<String> SUPPORTED_PROTOCOL_VERSIONS = Set.of(
             "2024-11-05",
             "2025-03-26",
             "2025-06-18"
@@ -43,13 +43,25 @@ public final class McpServer {
     private final Map<String, McpResource> resources = new LinkedHashMap<>();
     private final Map<String, McpPrompt> prompts = new LinkedHashMap<>();
 
-    private volatile boolean initialized = false;
+    private final McpSession defaultSession = new McpSession("stdio");
 
     public McpServer(String serverName, String serverVersion, String instructions, PrintStream logStream) {
         this.serverName = serverName;
         this.serverVersion = serverVersion;
         this.instructions = instructions;
         this.logStream = logStream;
+    }
+
+    public String getServerName() {
+        return serverName;
+    }
+
+    public String getServerVersion() {
+        return serverVersion;
+    }
+
+    public static boolean isSupportedProtocolVersion(String version) {
+        return version != null && SUPPORTED_PROTOCOL_VERSIONS.contains(version);
     }
 
     public McpServer registerTool(McpTool tool) {
@@ -68,7 +80,51 @@ public final class McpServer {
     }
 
     public boolean isInitialized() {
-        return initialized;
+        return defaultSession.isInitialized();
+    }
+
+    /**
+     * 单个 MCP 客户端会话状态（用于隔离 Stdio 与多个 HTTP 客户端会话）。
+     */
+    public static final class McpSession {
+        private final String id;
+        private volatile boolean initialized;
+        private volatile String negotiatedProtocolVersion = LATEST_PROTOCOL_VERSION;
+
+        public McpSession(String id) {
+            this.id = id;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public boolean isInitialized() {
+            return initialized;
+        }
+
+        void markInitialized() {
+            this.initialized = true;
+        }
+
+        public String protocolVersion() {
+            return negotiatedProtocolVersion;
+        }
+
+        void setProtocolVersion(String protocolVersion) {
+            this.negotiatedProtocolVersion = protocolVersion;
+        }
+    }
+
+    /**
+     * 单次 JSON-RPC 消息处理结果，供 Stdio 与 HTTP 传输层复用。
+     */
+    public record DispatchOutcome(
+            String responseJson,
+            boolean parseError,
+            boolean initializedHandshake,
+            String negotiatedProtocolVersion
+    ) {
     }
 
     /**
@@ -93,35 +149,50 @@ public final class McpServer {
     }
 
     /**
-     * 处理单行 JSON-RPC 2.0 消息（支持单条请求与批量请求数组）。
+     * 处理单行 JSON-RPC 2.0 消息（使用默认 Stdio 会话，支持单条请求与批量请求数组）。
      *
      * @return 需要写回客户端的 JSON 字符串；若消息仅为 Notification，则返回 {@code null}。
      */
     public String handleLine(String line) {
-        if (line == null) {
-            return null;
+        return handleMessage(line, defaultSession).responseJson();
+    }
+
+    /**
+     * 在指定会话上下文中处理一条 JSON-RPC 2.0 消息或批量请求数组。
+     */
+    public DispatchOutcome handleMessage(String payload, McpSession session) {
+        if (payload == null) {
+            return new DispatchOutcome(null, false, false, null);
         }
-        if (!line.isEmpty() && line.charAt(0) == '\uFEFF') {
-            line = line.substring(1);
+        String text = payload;
+        if (!text.isEmpty() && text.charAt(0) == '\uFEFF') {
+            text = text.substring(1);
         }
-        if (line.isBlank()) {
-            return null;
-        }
-        Object parsed;
-        try {
-            parsed = JsonCodec.parse(line);
-        } catch (JsonParseException e) {
-            return JsonRpc.stringifyError(null, JsonRpc.PARSE_ERROR, "Parse error: " + e.getMessage());
+        if (text.isBlank()) {
+            return new DispatchOutcome(null, false, false, null);
         }
 
+        McpSession activeSession = (session != null) ? session : defaultSession;
+        Object parsed;
+        try {
+            parsed = JsonCodec.parse(text);
+        } catch (JsonParseException e) {
+            String err = JsonRpc.stringifyError(null, JsonRpc.PARSE_ERROR, "Parse error: " + e.getMessage());
+            return new DispatchOutcome(err, true, false, null);
+        }
+
+        SessionTracker tracker = new SessionTracker();
+
         if (parsed instanceof Map<?, ?>) {
-            Map<String, Object> response = processMessage(JsonCodec.asObject(parsed));
-            return response == null ? null : JsonCodec.stringify(response);
+            Map<String, Object> response = processMessage(JsonCodec.asObject(parsed), activeSession, tracker);
+            String json = (response == null) ? null : JsonCodec.stringify(response);
+            return new DispatchOutcome(json, false, tracker.initializedHandshake, tracker.negotiatedVersion);
         }
 
         if (parsed instanceof List<?> batch) {
             if (batch.isEmpty()) {
-                return JsonRpc.stringifyError(null, JsonRpc.INVALID_REQUEST, "Invalid Request: empty batch");
+                String err = JsonRpc.stringifyError(null, JsonRpc.INVALID_REQUEST, "Invalid Request: empty batch");
+                return new DispatchOutcome(err, false, false, null);
             }
             List<Map<String, Object>> responses = new ArrayList<>();
             for (Object item : batch) {
@@ -129,19 +200,26 @@ public final class McpServer {
                 if (msg == null) {
                     responses.add(JsonRpc.errorResponse(null, JsonRpc.INVALID_REQUEST, "Invalid Request: batch item must be an object", null));
                 } else {
-                    Map<String, Object> resp = processMessage(msg);
+                    Map<String, Object> resp = processMessage(msg, activeSession, tracker);
                     if (resp != null) {
                         responses.add(resp);
                     }
                 }
             }
-            return responses.isEmpty() ? null : JsonCodec.stringify(responses);
+            String json = responses.isEmpty() ? null : JsonCodec.stringify(responses);
+            return new DispatchOutcome(json, false, tracker.initializedHandshake, tracker.negotiatedVersion);
         }
 
-        return JsonRpc.stringifyError(null, JsonRpc.INVALID_REQUEST, "Invalid Request: top-level JSON must be object or array");
+        String err = JsonRpc.stringifyError(null, JsonRpc.INVALID_REQUEST, "Invalid Request: top-level JSON must be object or array");
+        return new DispatchOutcome(err, false, false, null);
     }
 
-    private Map<String, Object> processMessage(Map<String, Object> msg) {
+    private static final class SessionTracker {
+        boolean initializedHandshake;
+        String negotiatedVersion;
+    }
+
+    private Map<String, Object> processMessage(Map<String, Object> msg, McpSession session, SessionTracker tracker) {
         if (msg == null) {
             return JsonRpc.errorResponse(null, JsonRpc.INVALID_REQUEST, "Invalid Request", null);
         }
@@ -176,13 +254,13 @@ public final class McpServer {
 
         // Notification：不包含 id，服务端处理后不得返回响应
         if (!hasId) {
-            handleNotification(method, params);
+            handleNotification(method, params, session);
             return null;
         }
 
         // Request：必须返回带相同 id 的响应
         try {
-            Object result = dispatchRequest(method, params);
+            Object result = dispatchRequest(method, params, session, tracker);
             return JsonRpc.successResponse(id, result);
         } catch (JsonRpcException e) {
             return JsonRpc.errorResponse(id, e.getCode(), e.getMessage(), e.getData());
@@ -192,23 +270,23 @@ public final class McpServer {
         }
     }
 
-    private void handleNotification(String method, Map<String, Object> params) {
+    private void handleNotification(String method, Map<String, Object> params, McpSession session) {
         switch (method) {
             case "notifications/initialized" -> {
-                initialized = true;
-                log("Client completed MCP initialization handshake.");
+                session.markInitialized();
+                log("Client [" + session.id() + "] completed MCP initialization handshake.");
             }
             case "notifications/cancelled" -> {
                 Object requestId = params.get("requestId");
-                log("Received cancellation notification for requestId=" + requestId);
+                log("Received cancellation notification for requestId=" + requestId + " (session=" + session.id() + ")");
             }
             default -> log("Ignored notification: " + method);
         }
     }
 
-    private Object dispatchRequest(String method, Map<String, Object> params) throws Exception {
+    private Object dispatchRequest(String method, Map<String, Object> params, McpSession session, SessionTracker tracker) throws Exception {
         return switch (method) {
-            case "initialize" -> handleInitialize(params);
+            case "initialize" -> handleInitialize(params, session, tracker);
             case "ping" -> Collections.emptyMap();
             case "tools/list" -> handleToolsList();
             case "tools/call" -> handleToolsCall(params);
@@ -220,11 +298,14 @@ public final class McpServer {
         };
     }
 
-    private Map<String, Object> handleInitialize(Map<String, Object> params) {
+    private Map<String, Object> handleInitialize(Map<String, Object> params, McpSession session, SessionTracker tracker) {
         String requestedVersion = JsonCodec.asString(params.get("protocolVersion"));
-        String negotiatedVersion = (requestedVersion != null && SUPPORTED_PROTOCOL_VERSIONS.contains(requestedVersion))
+        String negotiatedVersion = isSupportedProtocolVersion(requestedVersion)
                 ? requestedVersion
                 : LATEST_PROTOCOL_VERSION;
+        session.setProtocolVersion(negotiatedVersion);
+        tracker.initializedHandshake = true;
+        tracker.negotiatedVersion = negotiatedVersion;
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
         if (!tools.isEmpty()) {
@@ -348,7 +429,7 @@ public final class McpServer {
         );
     }
 
-    private void log(String message) {
+    public void log(String message) {
         if (logStream != null) {
             logStream.println("[mcp-server] " + message);
             logStream.flush();
